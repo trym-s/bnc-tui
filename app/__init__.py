@@ -1,0 +1,1 @@
+"""bnc-tui application package."""
