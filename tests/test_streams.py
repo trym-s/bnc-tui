@@ -3,7 +3,9 @@ import contextlib
 import unittest
 from decimal import Decimal
 
+from app.clients.binance_rest import _parse_kline_row
 from app.models.events import ConnectionEvent, ConnectionState
+from app.streams.binance_kline_ws import CandleStreamManager, _parse as parse_kline
 from app.streams.binance_ws import StreamManager, _parse
 from app.streams.event_bus import EventBus
 
@@ -28,6 +30,64 @@ class StreamParsingTest(unittest.TestCase):
         self.assertEqual(
             manager._stream_url,
             "wss://stream.binance.com:9443/ws/btcusdt@miniTicker",
+        )
+
+    def test_parse_rest_kline_payload(self):
+        candle = _parse_kline_row(
+            "BTCUSDT",
+            "15m",
+            [
+                1710000000000,
+                "70000.00",
+                "70100.00",
+                "69900.00",
+                "70050.00",
+                "12.50000000",
+                1710000899999,
+                "875625.00",
+                1234,
+                "6.2",
+                "434000",
+                "0",
+            ],
+        )
+
+        self.assertEqual(candle.symbol, "BTCUSDT")
+        self.assertEqual(candle.interval, "15m")
+        self.assertEqual(candle.open_time_ms, 1710000000000)
+        self.assertEqual(candle.close_time_ms, 1710000899999)
+        self.assertEqual(candle.open, Decimal("70000.00"))
+        self.assertEqual(candle.high, Decimal("70100.00"))
+        self.assertEqual(candle.low, Decimal("69900.00"))
+        self.assertEqual(candle.close, Decimal("70050.00"))
+        self.assertEqual(candle.volume, Decimal("12.50000000"))
+        self.assertEqual(candle.quote_volume, Decimal("875625.00"))
+        self.assertEqual(candle.trade_count, 1234)
+        self.assertTrue(candle.is_closed)
+
+    def test_parse_kline_stream_payload(self):
+        candle = parse_kline(
+            '{"e":"kline","E":1710000001000,"s":"BTCUSDT","k":{'
+            '"t":1710000000000,"T":1710000899999,"s":"BTCUSDT","i":"15m",'
+            '"f":100,"L":200,"o":"70000.00","c":"70010.00","h":"70100.00",'
+            '"l":"69900.00","v":"10.5","n":101,"x":false,"q":"735000.00",'
+            '"V":"5.0","Q":"350000.00","B":"0"}}'
+        )
+
+        self.assertEqual(candle.symbol, "BTCUSDT")
+        self.assertEqual(candle.interval, "15m")
+        self.assertEqual(candle.open_time_ms, 1710000000000)
+        self.assertEqual(candle.close, Decimal("70010.00"))
+        self.assertFalse(candle.is_closed)
+
+    def test_candle_stream_manager_builds_symbol_specific_url(self):
+        manager = CandleStreamManager("BTCUSDT", EventBus(), interval="15m")
+
+        self.assertEqual(manager.symbol, "btcusdt")
+        self.assertEqual(manager.interval, "15m")
+        self.assertEqual(
+            manager._stream_url,
+            "wss://stream.binance.com:9443/ws/btcusdt@kline_15m",
         )
 
 

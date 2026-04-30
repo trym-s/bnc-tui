@@ -37,6 +37,23 @@ class PriceEvent:
 
 
 @dataclass(frozen=True)
+class CandleEvent:
+    """15m OHLC candle carried by REST bootstrap and kline WebSocket updates."""
+    symbol: str
+    interval: str
+    open_time_ms: int
+    close_time_ms: int
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+    quote_volume: Decimal
+    trade_count: int
+    is_closed: bool
+
+
+@dataclass(frozen=True)
 class ConnectionEvent:
     """
     Bağlantı durumu değiştiğinde publish edilen event.

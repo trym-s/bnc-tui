@@ -21,8 +21,12 @@ Neden create_task()?
 
 from __future__ import annotations
 
-import argparse
 import asyncio
+import math
+import os
+import subprocess
+import sys
+import time
 from decimal import Decimal, InvalidOperation
 
 from rich.columns import Columns
@@ -35,14 +39,29 @@ from textual.containers import Container, Horizontal
 from textual.widgets import Footer, Header, Label, Static
 
 from app.clients.binance_rest import BinanceClientError, BinanceRestClient, _calculate_summary
-from app.models.events import ConnectionEvent, ConnectionState, PriceEvent
+from app.models.events import CandleEvent, ConnectionEvent, ConnectionState, PriceEvent
 from app.storage.groups import GroupStore
+from app.storage.market_data import CandleCache, MarketDataStore, candle_interval_ms
+from app.streams.binance_kline_ws import CandleStreamManager
 from app.streams.binance_ws import StreamManager
 from app.streams.event_bus import EventBus
+
+DEFAULT_SYMBOL = "BTCFDUSD"
+APP_TITLE = "bnc"
 from app.tui.palette import P
 from app.tui.screens.trade_list import TradeListScreen
 
 _TRADE_REFRESH_SECONDS = 30.0
+_CANDLE_INTERVALS = (
+    ("1", "1m", "1 minute"),
+    ("2", "15m", "15 minute"),
+    ("3", "1h", "1 hour"),
+    ("4", "4h", "4 hour"),
+    ("5", "1d", "1 day"),
+)
+_DEFAULT_CANDLE_INTERVAL = "1m"
+_CANDLE_LIMIT = 96
+_CANDLE_RESYNC_SECONDS = 300.0
 
 
 class PriceApp(App[None]):
@@ -111,6 +130,7 @@ class PriceApp(App[None]):
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
         ("t", "trade_list", "Trades"),
+        ("c", "chart_interval_picker", "Chart"),
     ]
 
     def get_css_variables(self) -> dict[str, str]:
@@ -136,6 +156,7 @@ class PriceApp(App[None]):
         self,
         symbol: str,
         price_bus: EventBus[PriceEvent],
+        candle_bus: EventBus[CandleEvent],
         conn_bus: EventBus[ConnectionEvent],
         stream_manager: StreamManager,
         rest_client: BinanceRestClient,
@@ -143,18 +164,23 @@ class PriceApp(App[None]):
         super().__init__()
         self.symbol = symbol.upper()
         self._price_bus = price_bus
+        self._candle_bus = candle_bus
         self._conn_bus = conn_bus
         self._stream_manager = stream_manager
         self._rest_client = rest_client
+        self._candle_cache = CandleCache(MarketDataStore(), rest_client)
 
         # Son gelen değerleri saklıyoruz.
         # Fiyat WebSocket'ten, trade summary REST'ten geliyor.
         # İkisi bağımsız güncellendiği için ayrı tutulur.
         self._latest_event: PriceEvent | None = None
         self._latest_summary: dict = {}
+        self._latest_candles: list[CandleEvent] = []
         self._latest_balances: list[dict] = []
         self._latest_fdusd_rate: Decimal = Decimal("1")
         self._latest_trades: list[dict] = []
+        self._candle_interval = _DEFAULT_CANDLE_INTERVAL
+        self._is_picking_candle_interval = False
         self._group_store = GroupStore()
 
     def compose(self) -> ComposeResult:
@@ -169,27 +195,56 @@ class PriceApp(App[None]):
         yield Footer()
 
     async def on_mount(self) -> None:
+        _set_terminal_title(APP_TITLE)
 
         # StreamManager arka planda WebSocket'e bağlanıp push etmeye başlar
         self.run_worker(self._stream_manager.run(), exclusive=False)
+        self._start_candle_stream()
 
         # Fiyat event'lerini dinle
         self.run_worker(self._listen_prices(), exclusive=False)
+        self.run_worker(self._listen_candles(), exclusive=False)
 
         # Bağlantı durumunu dinle (status label için)
         self.run_worker(self._listen_connection(), exclusive=False)
 
         # Trade summary ve bakiyeyi ilk çek, sonra 30s'de bir yenile
         self.run_worker(self._refresh_trades_loop(), exclusive=False)
+        self.run_worker(self._refresh_candles_loop(), exclusive=False)
+        self.set_interval(1.0, self._render_dashboard)
 
     async def action_refresh(self) -> None:
         """r tuşu: trade summary + bakiyeyi manuel yenile"""
         await self._fetch_trades()
         await self._fetch_balances()
+        await self._fetch_candles()
 
     def action_trade_list(self) -> None:
         """t tuşu: trade listesi ekranına geç"""
         self.push_screen(TradeListScreen(self.symbol, self._latest_trades, self._group_store))
+
+    def action_chart_interval_picker(self) -> None:
+        """c tuşu: chart timeframe seçim modunu aç/kapat."""
+        self._is_picking_candle_interval = not self._is_picking_candle_interval
+        self._render_dashboard()
+
+    async def on_key(self, event) -> None:
+        if not self._is_picking_candle_interval:
+            return
+
+        interval_by_key = {key: interval for key, interval, _label in _CANDLE_INTERVALS}
+        if event.key == "escape":
+            self._is_picking_candle_interval = False
+            self._render_dashboard()
+            event.stop()
+            return
+
+        selected_interval = interval_by_key.get(event.key)
+        if selected_interval is None:
+            return
+
+        event.stop()
+        await self._set_candle_interval(selected_interval)
 
     def refresh_groups(self) -> None:
         """TradeListScreen grup değiştirince çağrılır, dashboard'ı yeniler."""
@@ -229,11 +284,27 @@ class PriceApp(App[None]):
                 status = self.query_one("#status", Label)
                 status.update(f"[{color}]{text}[/]")
 
+    async def _listen_candles(self) -> None:
+        """Live kline event'lerini mevcut candle penceresine merge eder."""
+        async with self._candle_bus.subscribe() as queue:
+            while True:
+                candle = await queue.get()
+                if candle.interval != self._candle_interval:
+                    continue
+                self._merge_candle(candle)
+                self._render_dashboard()
+
     async def _refresh_trades_loop(self) -> None:
         """Trade summary + bakiyeyi 30 saniyede bir çeker."""
         while True:
             await asyncio.gather(self._fetch_trades(), self._fetch_balances())
             await asyncio.sleep(_TRADE_REFRESH_SECONDS)
+
+    async def _refresh_candles_loop(self) -> None:
+        """Candle geçmişini açılışta ve periyodik olarak REST ile senkronlar."""
+        while True:
+            await self._fetch_candles()
+            await asyncio.sleep(_CANDLE_RESYNC_SECONDS)
 
     async def _fetch_trades(self) -> None:
         """Trade listesi + summary'yi direkt Binance REST'ten çek (cache'li)."""
@@ -253,6 +324,60 @@ class PriceApp(App[None]):
             self._render_dashboard()
         except BinanceClientError:
             pass  # bakiye hatası dashboard'ı engellemez
+
+    async def _fetch_candles(self) -> None:
+        """OHLC geçmişini public Binance REST'ten çek."""
+        interval = self._candle_interval
+        try:
+            step_ms = candle_interval_ms(interval)
+            end_time_ms = int(time.time() * 1000)
+            end_time_ms = end_time_ms - (end_time_ms % step_ms) + step_ms
+            start_time_ms = end_time_ms - (_CANDLE_LIMIT * step_ms)
+            candles = await self._candle_cache.get_or_fetch(
+                self.symbol,
+                interval=interval,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+            if interval != self._candle_interval:
+                return
+            self._latest_candles = _trim_candles(candles)
+            self._render_dashboard()
+        except BinanceClientError as exc:
+            error = self.query_one("#error", Static)
+            error.update(f"[{P.negative}]⚠  Kline fetch failed:[/] {exc}")
+
+    def _merge_candle(self, candle: CandleEvent) -> None:
+        self._latest_candles = _merge_candle_window(self._latest_candles, candle)
+
+    async def _set_candle_interval(self, interval: str) -> None:
+        if interval == self._candle_interval:
+            self._is_picking_candle_interval = False
+            self._render_dashboard()
+            return
+
+        self._candle_interval = interval
+        self._is_picking_candle_interval = False
+        self._latest_candles = []
+        self._start_candle_stream()
+        self._render_dashboard()
+        await self._fetch_candles()
+
+    def _start_candle_stream(self) -> None:
+        self.run_worker(
+            CandleStreamManager(
+                self.symbol,
+                self._candle_bus,
+                interval=self._candle_interval,
+            ).run(),
+            name="candle-stream",
+            group="candles",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    def on_resize(self) -> None:
+        self._render_dashboard()
 
     def _render_dashboard(self) -> None:
         """
@@ -278,6 +403,10 @@ class PriceApp(App[None]):
                 self._latest_fdusd_rate,
                 group_summaries,
                 self._latest_event,
+                self._latest_candles,
+                self._candle_interval,
+                self._is_picking_candle_interval,
+                max(24, self.size.width - 10),
             )
         )
 
@@ -339,6 +468,24 @@ def _loading_panel() -> Panel:
     return Panel(t, border_style=P.border, padding=(1, 2))
 
 
+def _set_terminal_title(title: str) -> None:
+    sys.stdout.write(f"\033]0;{title}\007")
+    sys.stdout.flush()
+
+    if "TMUX" not in os.environ:
+        return
+
+    try:
+        subprocess.run(
+            ["tmux", "rename-window", title],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
 def _pnl_style(value: Decimal) -> str:
     if value > 0:
         return f"bold {P.positive}"
@@ -373,6 +520,183 @@ def _safe_percentage(numerator: Decimal, denominator: Decimal) -> Decimal:
     return (numerator / denominator) * Decimal("100")
 
 
+def _trim_candles(candles: list[CandleEvent], limit: int = _CANDLE_LIMIT) -> list[CandleEvent]:
+    return sorted(candles, key=lambda c: c.open_time_ms)[-limit:]
+
+
+def _merge_candle_window(
+    candles: list[CandleEvent],
+    candle: CandleEvent,
+    limit: int = _CANDLE_LIMIT,
+) -> list[CandleEvent]:
+    by_open_time = {existing.open_time_ms: existing for existing in candles}
+    by_open_time[candle.open_time_ms] = candle
+    return _trim_candles(list(by_open_time.values()), limit)
+
+
+def _price_to_row(value: Decimal, log_low: float, log_span: float, height: int) -> int:
+    if log_span == 0:
+        return height // 2
+    log_val = math.log(float(value))
+    scaled = (log_val - log_low) / log_span
+    row = height - 1 - int(scaled * (height - 1) + 0.5)
+    return max(0, min(height - 1, row))
+
+
+def _volume_block(volume: Decimal, max_volume: Decimal) -> str:
+    blocks = "▁▂▃▄▅▆▇█"
+    if max_volume <= 0 or volume <= 0:
+        return " "
+    idx = int(((volume / max_volume) * Decimal(len(blocks) - 1)).to_integral_value())
+    return blocks[max(0, min(len(blocks) - 1, idx))]
+
+
+def _candle_interval_label(interval: str) -> str:
+    for _key, candidate, label in _CANDLE_INTERVALS:
+        if candidate == interval:
+            return label
+    return interval
+
+
+def _format_candle_countdown(close_time_ms: int, now_ms: int) -> str:
+    remaining_ms = close_time_ms - now_ms
+    if remaining_ms <= 0:
+        return "syncing"
+
+    total_seconds = (remaining_ms + 999) // 1000
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    return f"{hours}:{minutes:02}:{seconds:02}"
+
+
+def _format_candle_interval_options(
+    active_interval: str,
+    is_picking: bool,
+    close_time_ms: int | None = None,
+    now_ms: int | None = None,
+) -> Text:
+    text = Text()
+    prefix = "select " if is_picking else "c "
+    text.append(prefix, style=P.dim)
+    for index, (key, interval, label) in enumerate(_CANDLE_INTERVALS):
+        if index:
+            text.append("  ", style=P.dim)
+        is_active = interval == active_interval
+        style = f"bold {P.text}" if is_active else P.dim
+        text.append(f"{key}:{label}", style=style)
+    if close_time_ms is not None:
+        current_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        text.append("  closes in ", style=P.dim)
+        text.append(_format_candle_countdown(close_time_ms, current_ms), style=f"bold {P.neutral}")
+    return text
+
+
+def _build_candle_chart(
+    candles: list[CandleEvent],
+    width: int,
+    interval: str = _DEFAULT_CANDLE_INTERVAL,
+    is_picking_interval: bool = False,
+    now_ms: int | None = None,
+) -> Panel:
+    interval_label = _candle_interval_label(interval)
+    body = Text()
+    close_time_ms = candles[-1].close_time_ms if candles else None
+    body.append_text(
+        _format_candle_interval_options(
+            interval,
+            is_picking_interval,
+            close_time_ms=close_time_ms,
+            now_ms=now_ms,
+        )
+    )
+    body.append("\n\n")
+
+    if not candles:
+        body.append(f"Waiting for {interval_label} candles...", style=P.dim)
+        return Panel(
+            body,
+            title=f"  {interval_label}  OHLC",
+            border_style=P.border,
+            padding=(1, 2),
+        )
+
+    SLOT_WIDTH = 3
+    chart_height = 14
+
+    visible_count = max(4, min(len(candles), (width - 2) // SLOT_WIDTH))
+    visible = candles[-visible_count:]
+    plot_width = len(visible) * SLOT_WIDTH
+
+    low = min(c.low for c in visible)
+    high = max(c.high for c in visible)
+    max_volume = max(c.volume for c in visible)
+    log_low = math.log(float(low))
+    log_span = math.log(float(high)) - log_low
+
+    # SMA-20: precompute row position for each candle column
+    closes = [c.close for c in visible]
+    sma_rows: dict[int, int] = {}
+    if log_span > 0:
+        for i in range(len(visible)):
+            window = closes[max(0, i - 19): i + 1]
+            sma_val = sum(window) / len(window)
+            sma_rows[i] = _price_to_row(sma_val, log_low, log_span, chart_height)
+
+    for row in range(chart_height):
+        for i, candle in enumerate(visible):
+            high_row = _price_to_row(candle.high, log_low, log_span, chart_height)
+            low_row = _price_to_row(candle.low, log_low, log_span, chart_height)
+            open_row = _price_to_row(candle.open, log_low, log_span, chart_height)
+            close_row = _price_to_row(candle.close, log_low, log_span, chart_height)
+            body_top = min(open_row, close_row)
+            body_bottom = max(open_row, close_row)
+            candle_range = candle.high - candle.low
+            is_doji = candle_range > 0 and abs(candle.close - candle.open) / candle_range < Decimal("0.08")
+
+            is_live = (i == len(visible) - 1) and not candle.is_closed
+            is_bull = candle.close >= candle.open
+            body_style = P.positive if is_bull else P.negative
+            wick_style = "#f59e0b" if is_live else body_style
+
+            if body_top <= row <= body_bottom:
+                if is_doji:
+                    body.append(" ─ ", style=body_style)
+                else:
+                    char = "▒" if is_live else "█"
+                    body.append(f" {char} ", style=body_style)
+            elif high_row <= row < body_top or body_bottom < row <= low_row:
+                body.append(" │ ", style=wick_style)
+            elif sma_rows.get(i) == row:
+                body.append(" · ", style=P.muted)
+            else:
+                body.append(" " * SLOT_WIDTH)
+
+        body.append("\n")
+
+    # Volume section: thin separator + volume bars
+    body.append("╌" * plot_width, style=P.border)
+    body.append("\n")
+    for i, candle in enumerate(visible):
+        is_live = (i == len(visible) - 1) and not candle.is_closed
+        is_bull = candle.close >= candle.open
+        style = "#f59e0b" if is_live else (P.positive if is_bull else P.negative)
+        body.append(_volume_block(candle.volume, max_volume) * SLOT_WIDTH, style=style)
+
+    # Footer: last close + period move %
+    last = visible[-1]
+    move = last.close - visible[0].open
+    move_pct = _safe_percentage(move, visible[0].open)
+    move_color = P.positive if move >= 0 else P.negative
+    body.append(f"  {_format_money(last.close)}  {_format_signed_percent(move_pct)}", style=move_color)
+    if not last.is_closed:
+        body.append("  forming", style=P.dim)
+
+    title = f"{interval_label}  ·  {len(visible)} bars  ·  {_format_signed_percent(move_pct)}"
+    border = P.positive if move >= 0 else P.negative
+    return Panel(body, title=title, border_style=border, padding=(1, 2))
+
+
 def _build_dashboard(
     symbol: str,
     price: Decimal,
@@ -381,6 +705,10 @@ def _build_dashboard(
     fdusd_rate: Decimal,
     group_summaries: dict[str, dict],
     price_event: PriceEvent | None = None,
+    candles: list[CandleEvent] | None = None,
+    candle_interval: str = _DEFAULT_CANDLE_INTERVAL,
+    is_picking_candle_interval: bool = False,
+    width: int = 80,
 ) -> Group:
     base_asset, quote_asset = _split_symbol(symbol)
     remaining_qty = _to_decimal(payload.get("remaining_qty"))
@@ -423,7 +751,10 @@ def _build_dashboard(
     ticker_border = _pnl_border(price - average_cost_value) if average_cost_value > 0 else "bright_black"
     rows.append(Panel(ticker, border_style=ticker_border, padding=(1, 2)))
 
-    # ── 2. Open Position + Closed Trades ────────────────────────────── #
+    # ── 2. OHLC Chart ───────────────────────────────────────────────── #
+    rows.append(_build_candle_chart(candles or [], width, candle_interval, is_picking_candle_interval))
+
+    # ── 3. Open Position + Closed Trades ────────────────────────────── #
     position = _metric_table()
     _add_metric(position, "Avg cost", _format_optional_price(payload.get("average_cost"), quote_asset))
     _add_metric(position, "Cost basis", f"{_format_money(remaining_cost)} {quote_asset}")
@@ -457,7 +788,7 @@ def _build_dashboard(
         expand=True,
     ))
 
-    # ── 3. Account Balance ───────────────────────────────────────────── #
+    # ── 4. Account Balance ───────────────────────────────────────────── #
     filtered_balances = [b for b in balances if not b["asset"].startswith("LD")]
     balance_table = _metric_table()
     total_usd = Decimal("0")
@@ -479,7 +810,7 @@ def _build_dashboard(
 
     rows.append(Panel(balance_table, title="Account Balance", border_style=P.border_accent, padding=(1, 2)))
 
-    # ── 4. Groups ────────────────────────────────────────────────────── #
+    # ── 5. Groups ────────────────────────────────────────────────────── #
     for group_name, g in group_summaries.items():
         g_remaining_qty = _to_decimal(g.get("remaining_qty"))
         g_remaining_cost = _to_decimal(g.get("remaining_cost_quote"))
@@ -513,26 +844,20 @@ def _build_dashboard(
     return Group(*rows)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Live Binance dashboard (WebSocket)")
-    parser.add_argument("--symbol", default="BTCUSDT")
-    return parser.parse_args()
-
-
 def main() -> None:
     from dotenv import load_dotenv
     load_dotenv()
 
-    args = parse_args()
-
     price_bus: EventBus[PriceEvent] = EventBus()
+    candle_bus: EventBus[CandleEvent] = EventBus()
     conn_bus: EventBus[ConnectionEvent] = EventBus()
 
     PriceApp(
-        symbol=args.symbol,
+        symbol=DEFAULT_SYMBOL,
         price_bus=price_bus,
+        candle_bus=candle_bus,
         conn_bus=conn_bus,
-        stream_manager=StreamManager(args.symbol, price_bus, conn_bus),
+        stream_manager=StreamManager(DEFAULT_SYMBOL, price_bus, conn_bus),
         rest_client=BinanceRestClient(),
     ).run()
 

@@ -40,6 +40,8 @@ from tenacity import (
     wait_exponential,
 )
 
+from app.models.events import CandleEvent
+
 BINANCE_BASE_URL = "https://api.binance.com"
 
 _STABLECOINS = {"USDT", "USDC", "FDUSD", "BUSD", "DAI", "TUSD"}
@@ -47,6 +49,7 @@ _STABLECOINS = {"USDT", "USDC", "FDUSD", "BUSD", "DAI", "TUSD"}
 # İki ayrı cache: trade summary ve bakiye farklı TTL'e sahip
 _trade_cache: TTLCache = TTLCache(maxsize=10, ttl=30)
 _balance_cache: TTLCache = TTLCache(maxsize=1, ttl=30)
+_kline_cache: TTLCache = TTLCache(maxsize=20, ttl=30)
 
 
 class BinanceClientError(RuntimeError):
@@ -77,6 +80,58 @@ class BinanceRestClient:
         if cache_key not in _trade_cache:
             _trade_cache[cache_key] = await self._fetch_trades(symbol, limit)
         return _trade_cache[cache_key]
+
+    async def get_klines(
+        self,
+        symbol: str,
+        interval: str = "15m",
+        limit: int = 96,
+    ) -> list[CandleEvent]:
+        """Public OHLC candle history for the chart."""
+        safe_limit = max(1, min(limit, 1000))
+        cache_key = f"klines:{symbol.upper()}:{interval}:{safe_limit}"
+        if cache_key not in _kline_cache:
+            _kline_cache[cache_key] = await self._fetch_klines(
+                symbol,
+                interval,
+                safe_limit,
+            )
+        return _kline_cache[cache_key]
+
+    async def get_historical_klines(
+        self,
+        symbol: str,
+        interval: str,
+        start_time_ms: int,
+        end_time_ms: int,
+    ) -> list[CandleEvent]:
+        """Public OHLC candles for an exact historical time range."""
+        if end_time_ms <= start_time_ms:
+            return []
+
+        current_start = start_time_ms
+        candles: list[CandleEvent] = []
+        while current_start < end_time_ms:
+            page = await self._fetch_klines(
+                symbol,
+                interval,
+                limit=1000,
+                start_time_ms=current_start,
+                end_time_ms=end_time_ms - 1,
+            )
+            if not page:
+                break
+
+            candles.extend(c for c in page if c.open_time_ms < end_time_ms)
+            next_start = page[-1].open_time_ms + 1
+            if next_start <= current_start:
+                break
+            current_start = next_start
+
+            if len(page) < 1000:
+                break
+
+        return candles
 
     async def get_trade_summary(self, symbol: str, limit: int = 500) -> dict:
         """
@@ -186,6 +241,36 @@ class BinanceRestClient:
             raise BinanceClientError(_extract_error(exc.response)) from exc
         return resp.json()
 
+    async def _fetch_klines(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[CandleEvent]:
+        """Binance public /api/v3/klines response parsed into candle events."""
+        params = {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "limit": limit,
+        }
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.get(f"{self.base_url}/api/v3/klines", params=params)
+                resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise BinanceClientError(_extract_error(exc.response)) from exc
+
+        payload = resp.json()
+        if not isinstance(payload, list):
+            raise BinanceClientError("Binance geçersiz kline yanıtı döndürdü.")
+        return [_parse_kline_row(symbol, interval, row) for row in payload]
+
     @retry(
         # Kaç kez denesin? 3 (ilk deneme + 2 retry)
         stop=stop_after_attempt(3),
@@ -293,6 +378,24 @@ def _calculate_summary(symbol: str, trades: list[dict]) -> dict:
 
 def _safe_div(a: Decimal, b: Decimal) -> Decimal | None:
     return None if b == 0 else a / b
+
+
+def _parse_kline_row(symbol: str, interval: str, row: list) -> CandleEvent:
+    """Parse Binance REST kline array."""
+    return CandleEvent(
+        symbol=symbol.upper(),
+        interval=interval,
+        open_time_ms=int(row[0]),
+        open=Decimal(row[1]),
+        high=Decimal(row[2]),
+        low=Decimal(row[3]),
+        close=Decimal(row[4]),
+        volume=Decimal(row[5]),
+        close_time_ms=int(row[6]),
+        quote_volume=Decimal(row[7]),
+        trade_count=int(row[8]),
+        is_closed=True,
+    )
 
 
 def _extract_error(response: httpx.Response) -> str:
