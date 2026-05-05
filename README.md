@@ -4,6 +4,8 @@ A Binance terminal dashboard that lives in your terminal. Pick a pair, see the l
 
 Prices come directly from Binance's WebSocket (no polling, no middleman). Trade history and balances are fetched via signed REST every 30 seconds and cached. There's also a backtesting engine for running rule-based strategies against historical candle data.
 
+![bnc-tui screenshot](bnc-tui.png)
+
 ## What it shows
 
 For the selected pair (e.g. `BTCUSDT`):
@@ -21,10 +23,20 @@ For the selected pair (e.g. `BTCUSDT`):
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-
-cp .env.example .env
-# fill in BINANCE_API_KEY and BINANCE_API_SECRET
 ```
+
+Copy `.env.example` and fill in your Binance API credentials:
+
+```bash
+cp .env.example .env
+```
+
+```env
+BINANCE_API_KEY=your_key_here
+BINANCE_API_SECRET=your_secret_here
+```
+
+API key and secret are only needed for trade history and account balances. Price streaming and backtesting work without credentials.
 
 ```bash
 bnc-tui --symbol BTCUSDT
@@ -186,6 +198,7 @@ python -m unittest discover tests
 - [ ] Futures support — position display for USD-M futures (partially implemented)
 - [ ] Portfolio overview mode — aggregate PnL across all open pairs
 - [ ] Configurable refresh rate — currently hardcoded at 30 s for REST
+- [ ] Chart optimisation — increase bar density, add indicators (EMA overlay, volume profile), smoother rendering at narrow terminal widths
 
 ## License
 
