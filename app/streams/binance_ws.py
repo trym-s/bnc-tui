@@ -1,17 +1,12 @@
 """
-StreamManager — Reconnect + EventBus entegrasyonu
+StreamManager — WebSocket reconnect loop with EventBus integration.
 
-Adım 2'den değişen:
-  - ConnectionState ve event tipleri artık models/events.py'den geliyor
-  - StreamManager bir EventBus alıyor, mesajları ona publish ediyor
-  - Bağlantı durumu değişince ConnectionEvent de publish ediliyor
-
-State Machine:
-  DISCONNECTED ──start()──▶ CONNECTING ──başarı──▶ CONNECTED
-                                 │                      │
-                            hata/kopuş ◀────────────────┘
-                                 │
-                            RECONNECTING ──backoff──▶ CONNECTING
+State machine:
+  DISCONNECTED ──run()──▶ CONNECTING ──success──▶ CONNECTED
+                               │                      │
+                          error/close ◀───────────────┘
+                               │
+                          RECONNECTING ──backoff──▶ CONNECTING
 """
 
 import asyncio
@@ -34,6 +29,7 @@ _BACKOFF_MAX = 30.0
 
 
 def _parse(raw: str) -> PriceEvent:
+    """Parse a raw miniTicker WebSocket message into a PriceEvent."""
     data = json.loads(raw)
     return PriceEvent(
         symbol=data["s"],
@@ -46,24 +42,22 @@ def _parse(raw: str) -> PriceEvent:
 
 class StreamManager:
     """
-    Binance WebSocket stream'ini yöneten ve EventBus'a publish eden sınıf.
+    Manages the Binance miniTicker WebSocket stream and publishes to EventBus.
 
-    Kullanım:
+    Usage:
         price_bus = EventBus[PriceEvent]()
         conn_bus  = EventBus[ConnectionEvent]()
 
         manager = StreamManager("BTCUSDT", price_bus, conn_bus)
-        asyncio.create_task(manager.run())   # arka planda çalışır
+        asyncio.create_task(manager.run())
 
-        # TUI tarafında:
         async with price_bus.subscribe() as queue:
             while True:
                 event = await queue.get()
                 print(event.price)
 
-    Neden run() ayrı task?
-      manager.run() sonsuz döngü. TUI ile aynı anda çalışması gerekiyor.
-      asyncio.create_task() ile arka plana alınır, her ikisi paralel yürür.
+    run() is an infinite loop that must run concurrently with the TUI.
+    Use asyncio.create_task() or Textual's run_worker() to launch it.
     """
 
     def __init__(
@@ -71,23 +65,27 @@ class StreamManager:
         symbol: str,
         price_bus: EventBus[PriceEvent],
         conn_bus: EventBus[ConnectionEvent],
+        stream_base_url: str = "wss://stream.binance.com:9443/ws",
     ) -> None:
         self.symbol = symbol.lower()
         self.state = ConnectionState.DISCONNECTED
         self._price_bus = price_bus
         self._conn_bus = conn_bus
-        self._stream_url = f"wss://stream.binance.com:9443/ws/{self.symbol}@miniTicker"
+        self._stream_url = f"{stream_base_url.rstrip('/')}/{self.symbol}@miniTicker"
 
     async def run(self) -> None:
         """
-        Ana döngü. asyncio.create_task() ile başlatılır.
-        Durdurmak için task.cancel() kullanılır.
+        Main loop. Start with asyncio.create_task(); cancel the task to stop.
+
+        Reconnects automatically with exponential backoff after any disconnect
+        or error. Respects Binance's 23-hour connection limit by cycling the
+        connection before it is forcibly closed.
         """
         backoff = _BACKOFF_BASE
 
         while True:
             await self._set_state(ConnectionState.CONNECTING)
-            logger.info("Bağlanıyor: %s", self._stream_url)
+            logger.info("Connecting: %s", self._stream_url)
 
             try:
                 async with self._open_connection() as ws:
@@ -101,29 +99,28 @@ class StreamManager:
                         await self._price_bus.publish(_parse(raw))
 
             except ConnectionClosed as exc:
-                logger.warning("Bağlantı kapandı: code=%s reason=%s", exc.code, exc.reason)
+                logger.warning("Connection closed: code=%s reason=%s", exc.code, exc.reason)
 
             except OSError as exc:
-                logger.warning("Ağ hatası: %s", exc)
+                logger.warning("Network error: %s", exc)
 
             except asyncio.CancelledError:
-                # Task iptal edildi (uygulama kapanıyor) — temizle ve çık
                 await self._set_state(ConnectionState.DISCONNECTED)
                 raise
 
             except Exception as exc:
-                logger.error("Beklenmedik hata: %s", exc, exc_info=True)
+                logger.error("Unexpected error: %s", exc, exc_info=True)
 
             await self._set_state(
                 ConnectionState.RECONNECTING,
                 detail=f"{backoff:.0f}s",
             )
-            logger.info("%.0fs sonra yeniden bağlanılacak...", backoff)
+            logger.info("Reconnecting in %.0f s...", backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, _BACKOFF_MAX)
 
     async def _set_state(self, state: ConnectionState, detail: str = "") -> None:
-        """State'i güncelle ve ConnectionEvent publish et."""
+        """Update internal state and publish a ConnectionEvent."""
         self.state = state
         await self._conn_bus.publish(ConnectionEvent(state=state, detail=detail))
 
@@ -134,4 +131,4 @@ class StreamManager:
                 async with asyncio.timeout(_BINANCE_MAX_CONN_SECONDS):
                     yield ws
             except TimeoutError:
-                logger.info("23 saatlik limit doldu, yeniden bağlanıyor...")
+                logger.info("23-hour connection limit reached, reconnecting...")

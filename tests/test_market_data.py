@@ -52,6 +52,14 @@ class MarketDataStoreTest(unittest.TestCase):
         self.assertEqual(len(loaded), 1)
         self.assertEqual(loaded[0].close, Decimal("70100"))
 
+    def test_get_latest_candles_returns_oldest_to_newest(self):
+        store = MarketDataStore(self.path)
+
+        store.upsert_candles([candle(0), candle(60_000), candle(120_000)])
+        loaded = store.get_latest_candles("BTCFDUSD", "1m", limit=2)
+
+        self.assertEqual([c.open_time_ms for c in loaded], [60_000, 120_000])
+
 
 class CandleCacheTest(unittest.IsolatedAsyncioTestCase):
     async def test_fetches_missing_candles_once_then_reads_from_sqlite(self):

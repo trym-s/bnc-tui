@@ -22,6 +22,7 @@ _BACKOFF_MAX = 30.0
 
 
 def _parse(raw: str) -> CandleEvent:
+    """Parse a raw kline WebSocket message into a CandleEvent."""
     data = json.loads(raw)
     kline = data["k"]
     return CandleEvent(
@@ -49,6 +50,7 @@ class CandleStreamManager:
         candle_bus: EventBus[CandleEvent],
         conn_bus: EventBus[ConnectionEvent] | None = None,
         interval: str = "15m",
+        stream_base_url: str = "wss://stream.binance.com:9443/ws",
     ) -> None:
         self.symbol = symbol.lower()
         self.interval = interval
@@ -56,7 +58,7 @@ class CandleStreamManager:
         self._candle_bus = candle_bus
         self._conn_bus = conn_bus
         self._stream_url = (
-            f"wss://stream.binance.com:9443/ws/{self.symbol}@kline_{self.interval}"
+            f"{stream_base_url.rstrip('/')}/{self.symbol}@kline_{self.interval}"
         )
 
     async def run(self) -> None:
@@ -64,7 +66,7 @@ class CandleStreamManager:
 
         while True:
             await self._set_state(ConnectionState.CONNECTING)
-            logger.info("Kline stream bağlanıyor: %s", self._stream_url)
+            logger.info("Kline stream connecting: %s", self._stream_url)
 
             try:
                 async with self._open_connection() as ws:
@@ -75,17 +77,17 @@ class CandleStreamManager:
                         await self._candle_bus.publish(_parse(raw))
 
             except ConnectionClosed as exc:
-                logger.warning("Kline bağlantısı kapandı: code=%s reason=%s", exc.code, exc.reason)
+                logger.warning("Kline connection closed: code=%s reason=%s", exc.code, exc.reason)
 
             except OSError as exc:
-                logger.warning("Kline ağ hatası: %s", exc)
+                logger.warning("Kline network error: %s", exc)
 
             except asyncio.CancelledError:
                 await self._set_state(ConnectionState.DISCONNECTED)
                 raise
 
             except Exception as exc:
-                logger.error("Kline beklenmedik hata: %s", exc, exc_info=True)
+                logger.error("Kline unexpected error: %s", exc, exc_info=True)
 
             await self._set_state(ConnectionState.RECONNECTING, f"{backoff:.0f}s")
             await asyncio.sleep(backoff)
@@ -103,4 +105,4 @@ class CandleStreamManager:
                 async with asyncio.timeout(_BINANCE_MAX_CONN_SECONDS):
                     yield ws
             except TimeoutError:
-                logger.info("Kline 23 saatlik limit doldu, yeniden bağlanıyor...")
+                logger.info("Kline 23-hour connection limit reached, reconnecting...")

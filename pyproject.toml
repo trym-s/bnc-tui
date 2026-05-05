@@ -5,8 +5,23 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bnc-tui"
 version = "0.2.0"
-description = "WebSocket-first Binance terminal dashboard"
+description = "WebSocket-first Binance terminal dashboard with a built-in backtesting engine"
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.12"
+authors = [{ name = "trym-s" }]
+keywords = ["binance", "trading", "terminal", "tui", "websocket", "backtest"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Terminals",
+]
 dependencies = [
     "httpx>=0.27.0",
     "python-dotenv>=1.0.0",
@@ -16,8 +31,19 @@ dependencies = [
     "tenacity>=9.0",
 ]
 
+[project.urls]
+Repository = "https://github.com/trym-s/bnc-tui"
+
 [project.scripts]
 bnc-tui = "app.tui.app:main"
+bnc-backtest = "app.backtest.cli:main"
 
 [tool.setuptools]
-packages = ["app", "app.streams", "app.models", "app.tui", "app.tui.screens", "app.clients", "app.storage"]
+packages = ["app", "app.streams", "app.models", "app.tui", "app.tui.screens", "app.clients", "app.storage", "app.backtest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/tui/*"]
