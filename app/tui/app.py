@@ -38,6 +38,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal
 from textual.widgets import Footer, Header, Label, Static
 
+from app.clients.binance_futures import BinanceFuturesRestClient
 from app.clients.binance_rest import BinanceClientError, BinanceRestClient, _calculate_summary
 from app.models.events import CandleEvent, ConnectionEvent, ConnectionState, PriceEvent
 from app.storage.groups import GroupStore
@@ -47,6 +48,9 @@ from app.streams.binance_ws import StreamManager
 from app.streams.event_bus import EventBus
 
 DEFAULT_SYMBOL = "BTCFDUSD"
+DEFAULT_FUTURES_SYMBOL = "BTCUSDT"
+SPOT_STREAM_BASE_URL = "wss://stream.binance.com:9443/ws"
+FUTURES_STREAM_BASE_URL = "wss://fstream.binance.com/ws"
 APP_TITLE = "bnc"
 from app.tui.palette import P
 from app.tui.screens.trade_list import TradeListScreen
@@ -160,6 +164,8 @@ class PriceApp(App[None]):
         conn_bus: EventBus[ConnectionEvent],
         stream_manager: StreamManager,
         rest_client: BinanceRestClient,
+        candle_stream_base_url: str = SPOT_STREAM_BASE_URL,
+        use_candle_cache: bool = True,
     ) -> None:
         super().__init__()
         self.symbol = symbol.upper()
@@ -169,6 +175,8 @@ class PriceApp(App[None]):
         self._stream_manager = stream_manager
         self._rest_client = rest_client
         self._candle_cache = CandleCache(MarketDataStore(), rest_client)
+        self._candle_stream_base_url = candle_stream_base_url
+        self._use_candle_cache = use_candle_cache
 
         # Son gelen değerleri saklıyoruz.
         # Fiyat WebSocket'ten, trade summary REST'ten geliyor.
@@ -333,12 +341,20 @@ class PriceApp(App[None]):
             end_time_ms = int(time.time() * 1000)
             end_time_ms = end_time_ms - (end_time_ms % step_ms) + step_ms
             start_time_ms = end_time_ms - (_CANDLE_LIMIT * step_ms)
-            candles = await self._candle_cache.get_or_fetch(
-                self.symbol,
-                interval=interval,
-                start_time_ms=start_time_ms,
-                end_time_ms=end_time_ms,
-            )
+            if self._use_candle_cache:
+                candles = await self._candle_cache.get_or_fetch(
+                    self.symbol,
+                    interval=interval,
+                    start_time_ms=start_time_ms,
+                    end_time_ms=end_time_ms,
+                )
+            else:
+                candles = await self._rest_client.get_historical_klines(
+                    self.symbol,
+                    interval=interval,
+                    start_time_ms=start_time_ms,
+                    end_time_ms=end_time_ms,
+                )
             if interval != self._candle_interval:
                 return
             self._latest_candles = _trim_candles(candles)
@@ -369,6 +385,7 @@ class PriceApp(App[None]):
                 self.symbol,
                 self._candle_bus,
                 interval=self._candle_interval,
+                stream_base_url=self._candle_stream_base_url,
             ).run(),
             name="candle-stream",
             group="candles",
@@ -453,6 +470,16 @@ def _format_optional_price(value: object, quote_asset: str) -> str:
     if value is None:
         return "—"
     return f"{_format_money(_to_decimal(value))} {quote_asset}"
+
+
+def _format_external_commissions(value: object) -> str:
+    if not isinstance(value, dict) or not value:
+        return ""
+    return "  ·  ".join(
+        f"{_format_quantity(_to_decimal(amount))} {asset}"
+        for asset, amount in sorted(value.items())
+        if _to_decimal(amount) > 0
+    )
 
 
 def _split_symbol(symbol: str) -> tuple[str, str]:
@@ -710,13 +737,20 @@ def _build_dashboard(
     is_picking_candle_interval: bool = False,
     width: int = 80,
 ) -> Group:
-    base_asset, quote_asset = _split_symbol(symbol)
+    symbol_base_asset, symbol_quote_asset = _split_symbol(symbol)
+    base_asset = str(payload.get("base_asset") or symbol_base_asset)
+    quote_asset = str(payload.get("quote_asset") or symbol_quote_asset)
     remaining_qty = _to_decimal(payload.get("remaining_qty"))
     remaining_cost = _to_decimal(payload.get("remaining_cost_quote"))
     market_value = remaining_qty * price
-    unrealized_pnl = market_value - remaining_cost
+    if "unrealized_pnl_quote" in payload:
+        unrealized_pnl = _to_decimal(payload.get("unrealized_pnl_quote"))
+    else:
+        unrealized_pnl = market_value - remaining_cost
     realized_pnl = _to_decimal(payload.get("realized_pnl_quote"))
-    average_cost_value = _to_decimal(payload.get("average_cost"))
+    break_even_value = _to_decimal(payload.get("break_even_price") or payload.get("average_cost"))
+    exact_commission_quote = _to_decimal(payload.get("exact_commission_quote"))
+    external_commissions = _format_external_commissions(payload.get("external_commissions"))
 
     rows: list = []
 
@@ -728,9 +762,9 @@ def _build_dashboard(
     price_text = Text()
     price_text.append(f"{_format_money(price)} {quote_asset}", style=f"bold {P.text}")
 
-    if average_cost_value > 0:
-        diff = price - average_cost_value
-        pct = _safe_percentage(diff, average_cost_value)
+    if break_even_value > 0:
+        diff = price - break_even_value
+        pct = _safe_percentage(diff, break_even_value)
         arrow = "▲" if diff >= 0 else "▼"
         pct_color = P.positive if diff >= 0 else P.negative
         price_text.append(f"   {arrow} {_format_signed_percent(pct)}", style=pct_color)
@@ -748,7 +782,7 @@ def _build_dashboard(
 
     ticker.add_row(price_text, stats_text)
 
-    ticker_border = _pnl_border(price - average_cost_value) if average_cost_value > 0 else "bright_black"
+    ticker_border = _pnl_border(price - break_even_value) if break_even_value > 0 else "bright_black"
     rows.append(Panel(ticker, border_style=ticker_border, padding=(1, 2)))
 
     # ── 2. OHLC Chart ───────────────────────────────────────────────── #
@@ -756,7 +790,7 @@ def _build_dashboard(
 
     # ── 3. Open Position + Closed Trades ────────────────────────────── #
     position = _metric_table()
-    _add_metric(position, "Avg cost", _format_optional_price(payload.get("average_cost"), quote_asset))
+    _add_metric(position, "Break-even", _format_optional_price(payload.get("break_even_price"), quote_asset))
     _add_metric(position, "Cost basis", f"{_format_money(remaining_cost)} {quote_asset}")
     _add_metric(position, "Market value", f"{_format_money(market_value)} {quote_asset}")
     _add_metric(
@@ -778,6 +812,10 @@ def _build_dashboard(
         "Trades",
         f"{payload.get('trade_count', '—')} total  ·  {payload.get('buy_count', '—')} buy  ·  {payload.get('sell_count', '—')} sell",
     )
+    if exact_commission_quote > 0:
+        _add_metric(realized, "Known fees", f"{_format_money(exact_commission_quote)} {quote_asset}")
+    if external_commissions:
+        _add_metric(realized, "Other fees", external_commissions)
 
     rows.append(Columns(
         [
@@ -817,14 +855,20 @@ def _build_dashboard(
         g_market_value = g_remaining_qty * price
         g_unrealized = g_market_value - g_remaining_cost
         g_realized = _to_decimal(g.get("realized_pnl_quote"))
+        g_exact_commission_quote = _to_decimal(g.get("exact_commission_quote"))
+        g_external_commissions = _format_external_commissions(g.get("external_commissions"))
 
         t = _metric_table()
         _add_metric(t, "Open qty", f"{_format_quantity(g_remaining_qty)} {base_asset}", f"bold {P.text}")
-        _add_metric(t, "Avg cost", _format_optional_price(g.get("average_cost"), quote_asset))
+        _add_metric(t, "Break-even", _format_optional_price(g.get("break_even_price"), quote_asset))
         _add_metric(t, "Cost basis", f"{_format_money(g_remaining_cost)} {quote_asset}")
         _add_metric(t, "Market value", f"{_format_money(g_market_value)} {quote_asset}")
         _add_metric(t, "Unrealized", f"{_format_signed_money(g_unrealized)} {quote_asset}", _pnl_style(g_unrealized))
         _add_metric(t, "Realized", f"{_format_signed_money(g_realized)} {quote_asset}", _pnl_style(g_realized))
+        if g_exact_commission_quote > 0:
+            _add_metric(t, "Known fees", f"{_format_money(g_exact_commission_quote)} {quote_asset}")
+        if g_external_commissions:
+            _add_metric(t, "Other fees", g_external_commissions)
         _add_metric(t, "Trades", f"{g.get('trade_count', 0)} total  ·  {g.get('buy_count', 0)} buy  ·  {g.get('sell_count', 0)} sell")
 
         border = _pnl_border(g_unrealized) if g_remaining_qty > 0 else "bright_black"
@@ -848,17 +892,25 @@ def main() -> None:
     from dotenv import load_dotenv
     load_dotenv()
 
+    market = os.getenv("BNC_MARKET", "spot").strip().lower()
+    is_futures = market in {"futures", "future", "usdm", "usdm_futures", "usd-m"}
+    symbol = os.getenv("BNC_SYMBOL", DEFAULT_FUTURES_SYMBOL if is_futures else DEFAULT_SYMBOL).upper()
+    rest_client = BinanceFuturesRestClient() if is_futures else BinanceRestClient()
+    stream_base_url = FUTURES_STREAM_BASE_URL if is_futures else SPOT_STREAM_BASE_URL
+
     price_bus: EventBus[PriceEvent] = EventBus()
     candle_bus: EventBus[CandleEvent] = EventBus()
     conn_bus: EventBus[ConnectionEvent] = EventBus()
 
     PriceApp(
-        symbol=DEFAULT_SYMBOL,
+        symbol=symbol,
         price_bus=price_bus,
         candle_bus=candle_bus,
         conn_bus=conn_bus,
-        stream_manager=StreamManager(DEFAULT_SYMBOL, price_bus, conn_bus),
-        rest_client=BinanceRestClient(),
+        stream_manager=StreamManager(symbol, price_bus, conn_bus, stream_base_url=stream_base_url),
+        rest_client=rest_client,
+        candle_stream_base_url=stream_base_url,
+        use_candle_cache=not is_futures,
     ).run()
 
 

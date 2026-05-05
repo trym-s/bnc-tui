@@ -64,6 +64,7 @@ class MarketDataStore:
             )
 
     def upsert_candles(self, candles: Iterable[CandleEvent]) -> int:
+        """Insert or replace candles. Returns the number of rows written."""
         rows = [
             (
                 candle.symbol.upper(),
@@ -115,6 +116,7 @@ class MarketDataStore:
         start_time_ms: int,
         end_time_ms: int,
     ) -> list[CandleEvent]:
+        """Return candles in [start_time_ms, end_time_ms) ordered by open_time_ms ascending."""
         _validate_interval(interval)
         with self._connect() as conn:
             rows = conn.execute(
@@ -138,6 +140,7 @@ class MarketDataStore:
         start_time_ms: int,
         end_time_ms: int,
     ) -> set[int]:
+        """Return the set of cached open_time_ms values within the given range."""
         _validate_interval(interval)
         with self._connect() as conn:
             rows = conn.execute(
@@ -152,6 +155,29 @@ class MarketDataStore:
                 (symbol.upper(), interval, start_time_ms, end_time_ms),
             ).fetchall()
         return {int(row["open_time_ms"]) for row in rows}
+
+    def get_latest_candles(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int,
+    ) -> list[CandleEvent]:
+        """Return the *limit* most recent candles ordered by open_time_ms ascending."""
+        _validate_interval(interval)
+        safe_limit = max(1, limit)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM candles
+                WHERE symbol = ?
+                  AND interval = ?
+                ORDER BY open_time_ms DESC
+                LIMIT ?
+                """,
+                (symbol.upper(), interval, safe_limit),
+            ).fetchall()
+        return [_row_to_candle(row) for row in reversed(rows)]
 
 
 class CandleCache:
@@ -172,6 +198,7 @@ class CandleCache:
         start_time_ms: int,
         end_time_ms: int,
     ) -> list[CandleEvent]:
+        """Return candles for the range, fetching any missing gaps from Binance REST."""
         _validate_interval(interval)
         start_time_ms = _align_open_time(start_time_ms, interval)
         missing_ranges = self._missing_ranges(symbol, interval, start_time_ms, end_time_ms)
@@ -194,6 +221,7 @@ class CandleCache:
         start_time_ms: int,
         end_time_ms: int,
     ) -> list[tuple[int, int]]:
+        """Identify contiguous gaps in the cached candle data and return them as (start, end) pairs."""
         step = _interval_ms(interval)
         cached = self._store.get_cached_open_times(
             symbol,

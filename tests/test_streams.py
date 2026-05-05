@@ -3,7 +3,8 @@ import contextlib
 import unittest
 from decimal import Decimal
 
-from app.clients.binance_rest import _parse_kline_row
+from app.clients.binance_futures import _position_summary
+from app.clients.binance_rest import _calculate_summary, _parse_kline_row
 from app.models.events import ConnectionEvent, ConnectionState
 from app.streams.binance_kline_ws import CandleStreamManager, _parse as parse_kline
 from app.streams.binance_ws import StreamManager, _parse
@@ -11,6 +12,101 @@ from app.streams.event_bus import EventBus
 
 
 class StreamParsingTest(unittest.TestCase):
+    def test_trade_summary_includes_quote_commission_in_break_even(self):
+        summary = _calculate_summary(
+            "BTCFDUSD",
+            [
+                {
+                    "id": 1,
+                    "time": 1710000000000,
+                    "isBuyer": True,
+                    "qty": "1",
+                    "quoteQty": "100",
+                    "price": "100",
+                    "commission": "1",
+                    "commissionAsset": "FDUSD",
+                }
+            ],
+        )
+
+        self.assertEqual(summary["remaining_qty"], Decimal("1"))
+        self.assertEqual(summary["remaining_cost_quote"], Decimal("101"))
+        self.assertEqual(summary["break_even_price"], Decimal("101"))
+        self.assertEqual(summary["exact_commission_quote"], Decimal("1"))
+
+    def test_trade_summary_includes_base_commission_in_break_even(self):
+        summary = _calculate_summary(
+            "BTCFDUSD",
+            [
+                {
+                    "id": 1,
+                    "time": 1710000000000,
+                    "isBuyer": True,
+                    "qty": "1",
+                    "quoteQty": "100",
+                    "price": "100",
+                    "commission": "0.01",
+                    "commissionAsset": "BTC",
+                }
+            ],
+        )
+
+        self.assertEqual(summary["remaining_qty"], Decimal("0.99"))
+        self.assertEqual(summary["remaining_cost_quote"], Decimal("100"))
+        self.assertEqual(summary["break_even_price"], Decimal("100") / Decimal("0.99"))
+
+    def test_trade_summary_realized_pnl_is_net_of_quote_commissions(self):
+        summary = _calculate_summary(
+            "BTCFDUSD",
+            [
+                {
+                    "id": 1,
+                    "time": 1710000000000,
+                    "isBuyer": True,
+                    "qty": "1",
+                    "quoteQty": "100",
+                    "price": "100",
+                    "commission": "1",
+                    "commissionAsset": "FDUSD",
+                },
+                {
+                    "id": 2,
+                    "time": 1710000060000,
+                    "isBuyer": False,
+                    "qty": "1",
+                    "quoteQty": "110",
+                    "price": "110",
+                    "commission": "1",
+                    "commissionAsset": "FDUSD",
+                },
+            ],
+        )
+
+        self.assertEqual(summary["remaining_qty"], Decimal("0"))
+        self.assertEqual(summary["remaining_cost_quote"], Decimal("0"))
+        self.assertEqual(summary["realized_pnl_quote"], Decimal("8"))
+        self.assertEqual(summary["exact_commission_quote"], Decimal("2"))
+
+    def test_trade_summary_keeps_external_commissions_separate(self):
+        summary = _calculate_summary(
+            "BTCFDUSD",
+            [
+                {
+                    "id": 1,
+                    "time": 1710000000000,
+                    "isBuyer": True,
+                    "qty": "1",
+                    "quoteQty": "100",
+                    "price": "100",
+                    "commission": "0.02",
+                    "commissionAsset": "BNB",
+                }
+            ],
+        )
+
+        self.assertEqual(summary["break_even_price"], Decimal("100"))
+        self.assertEqual(summary["external_commissions"], {"BNB": Decimal("0.02")})
+
     def test_parse_mini_ticker_payload(self):
         event = _parse(
             '{"e":"24hrMiniTicker","E":1710000000000,"s":"BTCUSDT",'
@@ -89,6 +185,59 @@ class StreamParsingTest(unittest.TestCase):
             manager._stream_url,
             "wss://stream.binance.com:9443/ws/btcusdt@kline_15m",
         )
+
+    def test_stream_managers_can_use_futures_base_url(self):
+        price_manager = StreamManager(
+            "BTCUSDT",
+            EventBus(),
+            EventBus(),
+            stream_base_url="wss://fstream.binance.com/ws",
+        )
+        candle_manager = CandleStreamManager(
+            "BTCUSDT",
+            EventBus(),
+            interval="1m",
+            stream_base_url="wss://fstream.binance.com/ws",
+        )
+
+        self.assertEqual(
+            price_manager._stream_url,
+            "wss://fstream.binance.com/ws/btcusdt@miniTicker",
+        )
+        self.assertEqual(
+            candle_manager._stream_url,
+            "wss://fstream.binance.com/ws/btcusdt@kline_1m",
+        )
+
+    def test_futures_position_summary_uses_exchange_break_even(self):
+        summary = _position_summary(
+            "BTCUSDT",
+            {
+                "symbol": "BTCUSDT",
+                "positionSide": "BOTH",
+                "positionAmt": "0.25",
+                "entryPrice": "100000",
+                "breakEvenPrice": "100012.5",
+                "unRealizedProfit": "10.25",
+                "marginAsset": "USDT",
+            },
+            [
+                {
+                    "id": 1,
+                    "isBuyer": True,
+                    "commission": "0.5",
+                    "commissionAsset": "USDT",
+                    "realizedPnl": "0",
+                }
+            ],
+        )
+
+        self.assertEqual(summary["remaining_qty"], Decimal("0.25"))
+        self.assertEqual(summary["average_cost"], Decimal("100000"))
+        self.assertEqual(summary["break_even_price"], Decimal("100012.5"))
+        self.assertEqual(summary["remaining_cost_quote"], Decimal("25003.125"))
+        self.assertEqual(summary["unrealized_pnl_quote"], Decimal("10.25"))
+        self.assertEqual(summary["exact_commission_quote"], Decimal("0.5"))
 
 
 class EventBusTest(unittest.IsolatedAsyncioTestCase):

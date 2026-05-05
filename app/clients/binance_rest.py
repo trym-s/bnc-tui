@@ -1,27 +1,9 @@
 """
-Adım 5: BinanceRestClient — FastAPI olmadan direkt Binance REST
+BinanceRestClient — direct Binance REST integration without a middleman.
 
-Eski akış:  TUI → FastAPI → BinanceClient → Binance
-Yeni akış:  TUI → BinanceRestClient → Binance
-
-Değişenler vs binance_client.py:
-  - get_price() kaldırıldı (WebSocket yapıyor)
-  - TTL cache eklendi: aynı sembol 30s içinde tekrar sorulmaz
-  - Retry eklendi: ağ hatası olursa 3 kez dener, exponential backoff ile
-
-TTL Cache nedir?
-  TTL = Time To Live. Cache'e koyduğun değer N saniye sonra otomatik silinir.
-  Sonraki istekte cache'de yoksa Binance'e gidilir, yenisi konur.
-
-  Neden 30s?
-    Trade history saniyede değişmez. 30s yeterli.
-    0s olursa her render'da Binance'e gidilir → rate limit riski.
-    300s olursa yeni trade'ler geç görünür.
-
-Retry nedir?
-  Ağ geçici olarak koparsa (timeout, DNS hatası) hemen hata vermek yerine
-  birkaç kez daha dener. Kalıcı hatada (401 Unauthorized, 400 Bad Request)
-  retry anlamsız olduğu için sadece ağ hatalarında dener.
+Trade history and balances are TTL-cached for 30 seconds to avoid hitting
+rate limits on every TUI refresh. Network errors are retried up to 3 times
+with exponential backoff (1 s → 2 s → 4 s). HTTP 4xx errors are not retried.
 """
 
 import hashlib
@@ -46,7 +28,6 @@ BINANCE_BASE_URL = "https://api.binance.com"
 
 _STABLECOINS = {"USDT", "USDC", "FDUSD", "BUSD", "DAI", "TUSD"}
 
-# İki ayrı cache: trade summary ve bakiye farklı TTL'e sahip
 _trade_cache: TTLCache = TTLCache(maxsize=10, ttl=30)
 _balance_cache: TTLCache = TTLCache(maxsize=1, ttl=30)
 _kline_cache: TTLCache = TTLCache(maxsize=20, ttl=30)
@@ -57,10 +38,7 @@ class BinanceClientError(RuntimeError):
 
 
 class BinanceRestClient:
-    """
-    Binance REST API ile doğrudan konuşan client.
-    Sadece trade summary — fiyat WebSocket'ten geliyor.
-    """
+    """Direct Binance REST API client. Prices are streamed via WebSocket; this client handles trade history, balances, and historical klines."""
 
     def __init__(
         self,
@@ -75,7 +53,7 @@ class BinanceRestClient:
         self.api_secret = api_secret or os.getenv("BINANCE_API_SECRET", "")
 
     async def get_trades(self, symbol: str, limit: int = 500) -> list[dict]:
-        """Ham trade listesi (cached). Trade list ekranı için kullanılır."""
+        """Return the raw trade list for a symbol (TTL-cached)."""
         cache_key = f"trades:{symbol.upper()}:{limit}"
         if cache_key not in _trade_cache:
             _trade_cache[cache_key] = await self._fetch_trades(symbol, limit)
@@ -134,15 +112,7 @@ class BinanceRestClient:
         return candles
 
     async def get_trade_summary(self, symbol: str, limit: int = 500) -> dict:
-        """
-        Trade summary döner.
-
-        Cache'de varsa Binance'e gitmez, cache'den döner.
-        Cache'de yoksa (ilk istek veya 30s geçti) Binance'e gider.
-
-        dict döndürüyoruz çünkü TUI zaten dict bekliyor
-        (eski FastAPI endpoint JSON döndürüyordu).
-        """
+        """Return a FIFO PnL summary dict for the symbol (TTL-cached)."""
         cache_key = f"{symbol.upper()}:{limit}"
 
         summary_key = f"summary:{symbol.upper()}:{limit}"
@@ -156,30 +126,21 @@ class BinanceRestClient:
 
     async def get_balances(self) -> tuple[list[dict], Decimal]:
         """
-        Hesaptaki tüm sıfır olmayan bakiyeleri USD değeriyle döner.
+        Return all non-zero balances with USD-equivalent values (TTL-cached).
 
-        Akış:
-          1. /api/v3/account → tüm coin bakiyeleri
-          2. /api/v3/ticker/price → tüm parite fiyatları (tek istek, ~2000 satır)
-          3. Her coin için {asset}USDT fiyatına bakarak USD değeri hesapla
-          4. Stablecoin'ler (USDT, USDC...) direkt 1:1
-
-        Neden tüm fiyatları tek seferde çekiyoruz?
-          Her coin için ayrı ayrı istek atmak yerine (N istek)
-          hepsini tek seferde alıp Python'da filtrelemek çok daha verimli.
-          Binance bu endpoint'i cache'liyor, hızlı döner.
+        Fetches /api/v3/account and /api/v3/ticker/price in parallel, then
+        maps each asset to its USD value via FDUSD or USDT pairs.
 
         Returns:
-          ([{"asset": "BTC", "free": Decimal, "locked": Decimal, "usd_value": Decimal}, ...],
-           fdusd_usdt_rate)
-          USD değerine göre büyükten küçüğe sıralı.
+            A tuple of (balances, fdusd_usdt_rate) where balances is a list of
+            dicts with keys: asset, free, locked, usd_value — sorted by
+            usd_value descending.
         """
         if "balances" in _balance_cache:
             return _balance_cache["balances"], _balance_cache["fdusd_rate"]
 
         account, all_prices = await self._fetch_account_and_prices()
 
-        # {symbol: price} dict'i — örn. {"BTCUSDT": Decimal("94000"), ...}
         price_map: dict[str, Decimal] = {
             p["symbol"]: Decimal(p["price"]) for p in all_prices
         }
@@ -199,7 +160,6 @@ class BinanceRestClient:
             if asset in _STABLECOINS:
                 usd_value = total
             else:
-                # FDUSD öncelikli, bulamazsa USDT'ye bak
                 pair_price = price_map.get(f"{asset}FDUSD") or price_map.get(f"{asset}USDT", Decimal("0"))
                 usd_value = total * pair_price
 
@@ -216,9 +176,8 @@ class BinanceRestClient:
         return result, fdusd_rate
 
     async def _fetch_account_and_prices(self) -> tuple[dict, list]:
-        """Account ve tüm fiyatları paralel çeker."""
+        """Fetch account info and all ticker prices concurrently."""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            # İki isteği paralel gönder — biri diğerini beklemiyor
             import asyncio
             account_task = asyncio.create_task(self._fetch_account(client))
             prices_task = asyncio.create_task(
@@ -230,7 +189,7 @@ class BinanceRestClient:
             return account, prices_resp.json()
 
     async def _fetch_account(self, client: httpx.AsyncClient) -> dict:
-        """Signed /api/v3/account isteği."""
+        """Send a signed /api/v3/account request and return the JSON payload."""
         params = {"timestamp": int(time.time() * 1000)}
         signed = self._signed_query(params)
         url = f"{self.base_url}/api/v3/account?{signed}"
@@ -268,24 +227,19 @@ class BinanceRestClient:
 
         payload = resp.json()
         if not isinstance(payload, list):
-            raise BinanceClientError("Binance geçersiz kline yanıtı döndürdü.")
+            raise BinanceClientError("Binance returned an unexpected kline response.")
         return [_parse_kline_row(symbol, interval, row) for row in payload]
 
     @retry(
-        # Kaç kez denesin? 3 (ilk deneme + 2 retry)
         stop=stop_after_attempt(3),
-        # Ne kadar beklesin denemeler arasında?
-        # wait_exponential: 1s → 2s → 4s (max 8s)
         wait=wait_exponential(multiplier=1, min=1, max=8),
-        # Hangi hatalarda retry? Sadece ağ hataları.
-        # 401/403/400 gibi kalıcı hatalarda retry anlamsız.
         retry=retry_if_exception_type((httpx.NetworkError, httpx.TimeoutException)),
     )
     async def _fetch_trades(self, symbol: str, limit: int) -> list[dict]:
-        """Binance'den ham trade listesini çeker (retry ile)."""
+        """Fetch raw trade list from Binance with retry on network errors."""
         if not self.api_key or not self.api_secret:
             raise BinanceClientError(
-                "BINANCE_API_KEY ve BINANCE_API_SECRET gerekli."
+                "BINANCE_API_KEY and BINANCE_API_SECRET are required."
             )
 
         params = {
@@ -305,7 +259,7 @@ class BinanceRestClient:
 
         payload = resp.json()
         if not isinstance(payload, list):
-            raise BinanceClientError("Binance geçersiz trade yanıtı döndürdü.")
+            raise BinanceClientError("Binance returned an unexpected trade response.")
         return payload
 
     def _signed_query(self, params: dict) -> str:
@@ -320,50 +274,76 @@ class BinanceRestClient:
 
 def _calculate_summary(symbol: str, trades: list[dict]) -> dict:
     """
-    Ham trade listesinden özet hesaplar.
-    Mantık binance_client.py'deki get_trade_summary ile aynı.
-    Ayrı fonksiyon çünkü pure hesaplama — HTTP yok, test edilmesi kolay.
+    Compute a FIFO average-cost PnL summary from a raw trade list.
+
+    Pure function — no HTTP calls, straightforward to test independently.
     """
+    symbol = symbol.upper()
+    base_asset, quote_asset = _infer_assets(symbol)
     ordered = sorted(trades, key=lambda t: t["time"])
 
     buy_count = sell_count = 0
     bought_qty = sold_qty = Decimal("0")
     buy_quote = sell_quote = Decimal("0")
     remaining_qty = remaining_cost = realized_pnl = Decimal("0")
+    exact_commission_quote = Decimal("0")
+    external_commissions: dict[str, Decimal] = {}
 
     for t in ordered:
         qty = Decimal(t["qty"])
         quote_qty = Decimal(t["quoteQty"])
         price = Decimal(t["price"])
+        commission = Decimal(str(t.get("commission", "0")))
+        commission_asset = str(t.get("commissionAsset", "")).upper()
+
+        quote_commission = Decimal("0")
+        if commission > 0 and commission_asset == quote_asset:
+            quote_commission = commission
+            exact_commission_quote += commission
+        elif commission > 0 and commission_asset and commission_asset != base_asset:
+            external_commissions[commission_asset] = (
+                external_commissions.get(commission_asset, Decimal("0")) + commission
+            )
 
         if t["isBuyer"]:
             buy_count += 1
-            bought_qty += qty
+            net_qty = qty
+            if commission > 0 and commission_asset == base_asset:
+                net_qty = max(Decimal("0"), qty - commission)
+
+            bought_qty += net_qty
             buy_quote += quote_qty
-            remaining_qty += qty
-            remaining_cost += quote_qty
+            remaining_qty += net_qty
+            remaining_cost += quote_qty + quote_commission
         else:
             sell_count += 1
-            sold_qty += qty
-            sell_quote += quote_qty
+            net_quote = quote_qty - quote_commission
+            base_commission = commission if commission > 0 and commission_asset == base_asset else Decimal("0")
+            qty_to_close = qty + base_commission
+            sold_qty += qty_to_close
+            sell_quote += net_quote
 
             if remaining_qty > 0:
                 avg_cost = remaining_cost / remaining_qty
-                qty_to_remove = min(qty, remaining_qty)
+                qty_to_remove = min(qty_to_close, remaining_qty)
                 cost_to_remove = qty_to_remove * avg_cost
-                realized_pnl += (price * qty_to_remove) - cost_to_remove
+                proceeds_for_closed_qty = net_quote * _safe_ratio(qty_to_remove, qty_to_close)
+                realized_pnl += proceeds_for_closed_qty - cost_to_remove
                 remaining_qty -= qty_to_remove
                 remaining_cost -= cost_to_remove
 
     if remaining_qty <= 0:
         remaining_qty = remaining_cost = Decimal("0")
+    average_cost = _safe_div(remaining_cost, remaining_qty)
 
     return {
-        "symbol": symbol.upper(),
+        "symbol": symbol,
+        "base_asset": base_asset,
+        "quote_asset": quote_asset,
         "trade_count": len(trades),
         "buy_count": buy_count,
         "sell_count": sell_count,
-        "bought_qty": remaining_qty and bought_qty,  # always return
+        "bought_qty": bought_qty,
         "sold_qty": sold_qty,
         "buy_quote_qty": buy_quote,
         "sell_quote_qty": sell_quote,
@@ -371,13 +351,27 @@ def _calculate_summary(symbol: str, trades: list[dict]) -> dict:
         "average_sell_price": _safe_div(sell_quote, sold_qty),
         "remaining_qty": remaining_qty,
         "remaining_cost_quote": remaining_cost,
-        "average_cost": _safe_div(remaining_cost, remaining_qty),
+        "average_cost": average_cost,
+        "break_even_price": average_cost,
+        "exact_commission_quote": exact_commission_quote,
+        "external_commissions": external_commissions,
         "realized_pnl_quote": realized_pnl,
     }
 
 
 def _safe_div(a: Decimal, b: Decimal) -> Decimal | None:
     return None if b == 0 else a / b
+
+
+def _safe_ratio(part: Decimal, total: Decimal) -> Decimal:
+    return Decimal("0") if total == 0 else part / total
+
+
+def _infer_assets(symbol: str) -> tuple[str, str]:
+    for quote_asset in sorted(_STABLECOINS, key=len, reverse=True):
+        if symbol.endswith(quote_asset):
+            return symbol[: -len(quote_asset)], quote_asset
+    return symbol[:-4], symbol[-4:]
 
 
 def _parse_kline_row(symbol: str, interval: str, row: list) -> CandleEvent:

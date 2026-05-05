@@ -15,6 +15,7 @@ from decimal import Decimal
 
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.coordinate import Coordinate
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static
 
@@ -150,6 +151,7 @@ class TradeListScreen(Screen):
 
     BINDINGS = [
         Binding("escape", "app.pop_screen", "Back"),
+        Binding("up", "cursor_up_or_wrap", "Up", show=False, priority=True),
         Binding("g", "assign_group", "Assign group"),
         Binding("d", "unassign", "Remove from group"),
     ]
@@ -192,6 +194,32 @@ class TradeListScreen(Screen):
             f"[bold {P.muted}]ESC[/] back[/]"
         )
 
+    def _selected_trade_id(self) -> int | None:
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            return None
+        cursor_key = table.coordinate_to_cell_key(table.cursor_coordinate)
+        return int(cursor_key.row_key.value)
+
+    def _refresh_selected_group_cell(self) -> None:
+        table = self.query_one(DataTable)
+        if table.cursor_row is None:
+            return
+        trade_id = self._selected_trade_id()
+        if trade_id is None:
+            return
+        group = self._store.get_trade_group(self._symbol, trade_id) or f"[{P.dim}]—[/]"
+        table.update_cell_at(Coordinate(table.cursor_row, 6), group, update_width=True)
+
+    def action_cursor_up_or_wrap(self) -> None:
+        table = self.query_one(DataTable)
+        if table.row_count == 0:
+            return
+        if table.cursor_row == 0:
+            table.move_cursor(row=table.row_count - 1, animate=False)
+            return
+        table.action_cursor_up()
+
     def action_assign_group(self) -> None:
         table = self.query_one(DataTable)
         if table.cursor_row is None:
@@ -203,17 +231,15 @@ class TradeListScreen(Screen):
             cursor_key = table.coordinate_to_cell_key(table.cursor_coordinate)
             trade_id = int(cursor_key.row_key.value)
             self._store.assign(self._symbol, trade_id, group_name)
-            self._populate()
+            self._refresh_selected_group_cell()
             self.app.refresh_groups()
 
         self.app.push_screen(GroupInputModal(), on_group_selected)
 
     def action_unassign(self) -> None:
-        table = self.query_one(DataTable)
-        if table.cursor_row is None:
+        trade_id = self._selected_trade_id()
+        if trade_id is None:
             return
-        cursor_key = table.coordinate_to_cell_key(table.cursor_coordinate)
-        trade_id = int(cursor_key.row_key.value)
         self._store.unassign(self._symbol, trade_id)
-        self._populate()
+        self._refresh_selected_group_cell()
         self.app.refresh_groups()
